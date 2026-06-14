@@ -123,3 +123,20 @@ def test_session_store_writes_turn_artifact(tmp_path, monkeypatch):
     assert payload["session_id"] == "session-1"
     assert payload["turn_index"] == 1
     assert payload["input"]["preview"] == "hi"
+
+
+def test_session_store_persists_working_memory(tmp_path, monkeypatch):
+    monkeypatch.setattr("core.session._SESSIONS_ROOT", tmp_path)
+
+    store = SessionStore(
+        cwd="/tmp/project",
+        model="test-model",
+        session_id="session-1",
+    )
+
+    path = store.save_working_memory({"summary": "latest context", "recent_messages": []})
+
+    assert path.name == "session-1.working-memory.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["summary"] == "latest context"
+    assert store.load_working_memory() == payload

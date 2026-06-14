@@ -16,6 +16,7 @@ from rich.table import Table
 from core.session import _extract_text
 
 from features.coordinator import current_session_mode, match_session_mode
+from features.memory import build_working_memory_snapshot
 
 if TYPE_CHECKING:
     from features.compact import CompactService
@@ -44,6 +45,7 @@ class CommandContext:
     new_session_store: object = None
     reconfigure_mode: object = None
     plan_manager: object = None
+    refresh_prompt: object = None
     pending_query: str | None = None  # set by commands that want a follow-up model query
 
 
@@ -240,7 +242,10 @@ def _cmd_resume(ctx: CommandContext, args: str) -> None:
     ctx.engine.set_messages(messages)
     if resumed_store is not None:
         ctx.engine.set_session_store(resumed_store)
+        resumed_store.save_working_memory(build_working_memory_snapshot(messages))
         ctx.session_store = resumed_store  # type: ignore[assignment]
+    if callable(ctx.refresh_prompt):
+        ctx.refresh_prompt()
 
     ctx.console.print(
         f"[green]✓[/green] Resumed session [bold]{target_meta.session_id[:8]}[/bold]: "
@@ -256,7 +261,10 @@ def _cmd_clear(ctx: CommandContext, args: str) -> None:
     if callable(ctx.new_session_store):
         new_store = ctx.new_session_store()
         ctx.engine.set_session_store(new_store)
+        new_store.save_working_memory(build_working_memory_snapshot([]))
         ctx.session_store = new_store  # type: ignore[assignment]
+    if callable(ctx.refresh_prompt):
+        ctx.refresh_prompt()
     ctx.console.print("[green]✓[/green] Conversation cleared. New session started.")
 
 

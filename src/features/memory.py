@@ -8,6 +8,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from core.session import _extract_text
+
 MEMORY_DIR = Path.home() / ".config" / "cc-mini" / "memory"
 SESSIONS_DIR = Path.home() / ".config" / "cc-mini" / "sessions"
 MAX_MEMORY_INDEX_CHARS = 10_000
@@ -188,14 +190,134 @@ def list_sessions_since(since_ts: float, sessions_dir: Path | None = None,
 # <memory> tag extraction
 # ---------------------------------------------------------------------------
 
+
 def extract_memory_tags(text: str) -> list[str]:
     """Extract all <memory>...</memory> tag contents from text."""
     return [m.strip() for m in re.findall(r"<memory>(.*?)</memory>", text, re.DOTALL)]
 
 
 # ---------------------------------------------------------------------------
+# Working memory
+# ---------------------------------------------------------------------------
+
+
+_WORKING_MEMORY_MAX_LEN = 280
+
+
+def _condense_text(text: str, limit: int = _WORKING_MEMORY_MAX_LEN) -> str:
+    compact = " ".join(text.split())
+    return compact if len(compact) <= limit else compact[: limit - 3] + "..."
+
+
+def build_working_memory_snapshot(
+    messages: list[dict],
+    turn_artifact: dict | None = None,
+    current: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    visible: list[tuple[str, str]] = []
+    for message in messages:
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        text = _extract_text(message.get("content", "")).strip()
+        if not text:
+            continue
+        if role == "user" and text.lstrip().startswith("<task-notification>"):
+            continue
+        visible.append((role, _condense_text(text, limit=220)))
+
+    recent_messages = [
+        {"role": role, "text": text}
+        for role, text in visible[-4:]
+    ]
+
+    last_user = next((text for role, text in reversed(visible) if role == "user"), "")
+    last_assistant = next((text for role, text in reversed(visible) if role == "assistant"), "")
+
+    summary_parts: list[str] = []
+    if last_user:
+        summary_parts.append(f"User: {last_user}")
+    if last_assistant:
+        summary_parts.append(f"Assistant: {last_assistant}")
+    summary = " | ".join(summary_parts)
+    if not summary and current:
+        summary = str(current.get("summary", ""))
+
+    carry_forwards: list[str] = []
+    if current:
+        for item in current.get("carry_forwards", []):
+            if isinstance(item, str) and item.strip():
+                carry_forwards.append(item.strip())
+
+    if turn_artifact:
+        context = turn_artifact.get("context") or {}
+        source = context.get("source") if isinstance(context, dict) else None
+        if source == "worker_notification":
+            note = context.get("summary") or "Worker notification received"
+            carry_forwards.append(_condense_text(str(note), limit=160))
+        auto_compact = context.get("auto_compact") if isinstance(context, dict) else None
+        if isinstance(auto_compact, dict) and auto_compact.get("triggered"):
+            status = auto_compact.get("status", "pending")
+            before_tokens = auto_compact.get("before_tokens")
+            after_tokens = auto_compact.get("after_tokens")
+            compact_note = f"Auto-compact {status}"
+            if before_tokens is not None and after_tokens is not None:
+                compact_note += f" ({before_tokens}→{after_tokens} tokens)"
+            carry_forwards.append(compact_note)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in carry_forwards[-6:]:
+        if item and item not in seen:
+            seen.add(item)
+            deduped.append(item)
+
+    return {
+        "summary": _condense_text(summary, limit=400),
+        "last_user": last_user,
+        "last_assistant": last_assistant,
+        "recent_messages": recent_messages,
+        "carry_forwards": deduped,
+        "updated_at": datetime.now().isoformat(),
+    }
+
+
+def build_working_memory_section(working_memory: dict[str, Any] | None) -> str:
+    if not working_memory:
+        return ""
+
+    lines = ["# Working Memory"]
+    summary = str(working_memory.get("summary", "")).strip()
+    if summary:
+        lines.append(f"Summary: {summary}")
+
+    carry_forwards = working_memory.get("carry_forwards") or []
+    if carry_forwards:
+        lines.append("Carry-forwards:")
+        for item in carry_forwards[:6]:
+            if isinstance(item, str) and item.strip():
+                lines.append(f"- {item.strip()}")
+
+    recent_messages = working_memory.get("recent_messages") or []
+    if recent_messages:
+        lines.append("Recent conversation:")
+        for item in recent_messages[-4:]:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            label = "User" if role == "user" else "Assistant"
+            lines.append(f"- {label}: {text}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # System prompt section
 # ---------------------------------------------------------------------------
+
 
 def build_memory_system_section(memory_dir: Path) -> str:
     """Return the memory instructions + MEMORY.md content for the system prompt.

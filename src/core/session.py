@@ -121,6 +121,7 @@ class SessionStore:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._jsonl_path = self._dir / f"{self.session_id}.jsonl"
         self._meta_path = self._dir / f"{self.session_id}.meta.json"
+        self._working_memory_path = self._dir / f"{self.session_id}.working-memory.json"
         self._message_count = 0
         self._title: str = ""
 
@@ -157,7 +158,7 @@ class SessionStore:
         with open(self._meta_path, "w", encoding="utf-8") as fh:
             json.dump(asdict(meta), fh, ensure_ascii=False)
 
-    def append_turn_(self, artifact: dict) -> Path:
+    def append_turn_artifact(self, artifact: dict) -> Path:
         turns_dir = self._dir / f"{self.session_id}.turns"
         turns_dir.mkdir(parents=True, exist_ok=True)
 
@@ -180,6 +181,22 @@ class SessionStore:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
         return path
+
+    def load_working_memory(self) -> dict[str, Any] | None:
+        if not self._working_memory_path.exists():
+            return None
+        try:
+            with open(self._working_memory_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def save_working_memory(self, working_memory: dict[str, Any]) -> Path:
+        with open(self._working_memory_path, "w", encoding="utf-8") as fh:
+            json.dump(working_memory, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        return self._working_memory_path
 
     # -- reading (class methods) -------------------------------------------
 

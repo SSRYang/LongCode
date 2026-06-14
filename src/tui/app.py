@@ -52,6 +52,7 @@ from features.memory import (
     release_lock,
     record_consolidation,
     read_last_consolidated_at,
+    build_working_memory_snapshot,
 )
 from features.skills import discover_skills, list_skills, build_skills_prompt_section
 from features.skills_bundled import register_bundled_skills
@@ -71,7 +72,8 @@ _DOUBLE_PRESS_TIMEOUT_MS = 0.8
 def _run_dream(engine: Engine, memory_dir: Path,
                permissions: PermissionChecker, quiet: bool = False,
                transcript_dir: str = "",
-               session_ids: list[str] | None = None) -> None:
+               session_ids: list[str] | None = None,
+               rebuild_prompt: object = None) -> None:
     """Run dream consolidation: snapshot messages, submit dream prompt, restore.
 
     Mirrors TS autoDream.ts — auto-dream (quiet=True) gets permission isolation;
@@ -100,7 +102,8 @@ def _run_dream(engine: Engine, memory_dir: Path,
             permissions.exit_dream_mode()
 
     # Rebuild system prompt to pick up updated MEMORY.md
-    engine.system_prompt = build_system_prompt(model=app_config.model, memory_dir=memory_dir)
+    if callable(rebuild_prompt):
+        engine.system_prompt = rebuild_prompt()
     record_consolidation(memory_dir)
     if not quiet:
         console.print("[dim]Dream consolidation complete. Memory index updated.[/dim]")
@@ -142,6 +145,78 @@ def _maybe_auto_compact(engine: Engine, compact_service: CompactService,
         info.update({"status": "failed", "error": str(e)})
         console.print(f"[dim red]Auto-compact failed: {e}[/dim red]")
     return info
+
+
+def _load_working_memory(session_store: SessionStore | None) -> dict | None:
+    if session_store is None:
+        return None
+    return session_store.load_working_memory()
+
+
+def _compose_system_prompt(
+    cwd: str,
+    model: str,
+    memory_dir: Path,
+    coordinator_enabled: bool,
+    skills_section: str,
+    worker_tool_names: list[str],
+    session_store: SessionStore | None,
+) -> str:
+    prompt = build_system_prompt(
+        cwd=cwd,
+        model=model,
+        memory_dir=memory_dir,
+        working_memory=_load_working_memory(session_store),
+    )
+    if skills_section:
+        prompt += "\n\n" + skills_section
+    if coordinator_enabled:
+        extra = get_coordinator_user_context(worker_tool_names)
+        worker_context = extra.get("workerToolsContext")
+        if worker_context:
+            prompt += "\n\n# Coordinator Context\n" + worker_context
+        prompt += "\n\n" + get_coordinator_system_prompt()
+    return prompt
+
+
+def _refresh_system_prompt(
+    engine: Engine,
+    cwd: str,
+    model: str,
+    memory_dir: Path,
+    coordinator_enabled: bool,
+    skills_section: str,
+    worker_tool_names: list[str],
+    session_store: SessionStore | None,
+) -> str:
+    prompt = _compose_system_prompt(
+        cwd=cwd,
+        model=model,
+        memory_dir=memory_dir,
+        coordinator_enabled=coordinator_enabled,
+        skills_section=skills_section,
+        worker_tool_names=worker_tool_names,
+        session_store=session_store,
+    )
+    engine.system_prompt = prompt
+    return prompt
+
+
+def _update_working_memory(
+    session_store: SessionStore | None,
+    engine: Engine,
+    turn_artifact: dict | None,
+) -> dict | None:
+    if session_store is None:
+        return None
+    current = session_store.load_working_memory()
+    snapshot = build_working_memory_snapshot(
+        engine.get_messages(),
+        turn_artifact=turn_artifact,
+        current=current,
+    )
+    session_store.save_working_memory(snapshot)
+    return snapshot
 
 
 def main() -> None:
@@ -210,16 +285,15 @@ def main() -> None:
     worker_tool_names = [tool.name for tool in _build_base_tools()]
 
     def _build_system_prompt_for_mode(coordinator_enabled: bool) -> str:
-        prompt = build_system_prompt(cwd=cwd, model=app_config.model, memory_dir=memory_dir)
-        if skills_section:
-            prompt += "\n\n" + skills_section
-        if coordinator_enabled:
-            extra = get_coordinator_user_context(worker_tool_names)
-            worker_context = extra.get("workerToolsContext")
-            if worker_context:
-                prompt += "\n\n# Coordinator Context\n" + worker_context
-            prompt += "\n\n" + get_coordinator_system_prompt()
-        return prompt
+        return _compose_system_prompt(
+            cwd=cwd,
+            model=app_config.model,
+            memory_dir=memory_dir,
+            coordinator_enabled=coordinator_enabled,
+            skills_section=skills_section,
+            worker_tool_names=worker_tool_names,
+            session_store=session_store,
+        )
 
     permissions = PermissionChecker(
         auto_approve=args.auto_approve,
@@ -231,9 +305,15 @@ def main() -> None:
             auto_approve=True,
             sandbox_manager=sandbox_mgr,
         )
-        worker_prompt = build_system_prompt(cwd=cwd, model=app_config.model, memory_dir=memory_dir)
-        if skills_section:
-            worker_prompt += "\n\n" + skills_section
+        worker_prompt = _compose_system_prompt(
+            cwd=cwd,
+            model=app_config.model,
+            memory_dir=memory_dir,
+            coordinator_enabled=False,
+            skills_section=skills_section,
+            worker_tool_names=worker_tool_names,
+            session_store=session_store,
+        )
         worker_prompt += "\n\n" + get_worker_system_prompt()
         return Engine(
             tools=_build_base_tools(),
@@ -363,7 +443,18 @@ def main() -> None:
                     session_id=target.session_id,
                     mode=current_session_mode(),
                 )
+                session_store.save_working_memory(build_working_memory_snapshot(msgs))
                 engine.set_session_store(session_store)
+                _refresh_system_prompt(
+                    engine,
+                    cwd=cwd,
+                    model=app_config.model,
+                    memory_dir=memory_dir,
+                    coordinator_enabled=is_coordinator_mode(),
+                    skills_section=skills_section,
+                    worker_tool_names=worker_tool_names,
+                    session_store=session_store,
+                )
                 console.print(f"[green]✓[/green] Resumed: {target.title[:50]}  "
                               f"({len(msgs)} messages)")
                 if warning:
@@ -485,13 +576,24 @@ def main() -> None:
                     icon = "[green]●[/green]" if status == "completed" else "[red]●[/red]"
                     console.print(f"\n{icon} [dim]{desc} ({uses} tool uses, {dur_s}s)[/dim]")
                     try:
-                        run_query(
+                        artifact = run_query(
                             engine,
                             notification,
                             print_mode=False,
                             permissions=permissions,
                             todo_manager=todo_manager,
                             turn_context={"source": "worker_notification", "summary": desc, "status": status},
+                        )
+                        _update_working_memory(session_store, engine, artifact)
+                        _refresh_system_prompt(
+                            engine,
+                            cwd=cwd,
+                            model=app_config.model,
+                            memory_dir=memory_dir,
+                            coordinator_enabled=is_coordinator_mode(),
+                            skills_section=skills_section,
+                            worker_tool_names=worker_tool_names,
+                            session_store=session_store,
                         )
                     except (KeyboardInterrupt, Exception):
                         return
@@ -627,7 +729,20 @@ def main() -> None:
                 app_config=app_config,
                 memory_dir=memory_dir,
                 permissions=permissions,
-                run_dream=lambda: _run_dream(engine, memory_dir, permissions),
+                run_dream=lambda: _run_dream(
+                    engine,
+                    memory_dir,
+                    permissions,
+                    rebuild_prompt=lambda: _compose_system_prompt(
+                        cwd=cwd,
+                        model=app_config.model,
+                        memory_dir=memory_dir,
+                        coordinator_enabled=is_coordinator_mode(),
+                        skills_section=skills_section,
+                        worker_tool_names=worker_tool_names,
+                        session_store=session_store,
+                    ),
+                ),
                 cost_tracker=cost_tracker,
                 new_session_store=lambda: SessionStore(
                     cwd=cwd,
@@ -636,6 +751,16 @@ def main() -> None:
                 ),
                 reconfigure_mode=_apply_session_mode,
                 plan_manager=plan_manager,
+                refresh_prompt=lambda: _refresh_system_prompt(
+                    engine,
+                    cwd=cwd,
+                    model=app_config.model,
+                    memory_dir=memory_dir,
+                    coordinator_enabled=is_coordinator_mode(),
+                    skills_section=skills_section,
+                    worker_tool_names=worker_tool_names,
+                    session_store=session_store,
+                ),
             )
             handle_command(cmd_name, cmd_args, cmd_ctx)
             session_store = cmd_ctx.session_store
@@ -684,7 +809,7 @@ def main() -> None:
         if _companion_addressed:
             continue
 
-        run_query(
+        artifact = run_query(
             engine,
             parse_input(user_input),
             print_mode=False,
@@ -695,6 +820,17 @@ def main() -> None:
                 "session_id": session_store.session_id if session_store else None,
                 "auto_compact": compact_info,
             },
+        )
+        _update_working_memory(session_store, engine, artifact)
+        _refresh_system_prompt(
+            engine,
+            cwd=cwd,
+            model=app_config.model,
+            memory_dir=memory_dir,
+            coordinator_enabled=is_coordinator_mode(),
+            skills_section=skills_section,
+            worker_tool_names=worker_tool_names,
+            session_store=session_store,
         )
         _drain_worker_notifications()
 
@@ -784,6 +920,15 @@ def main() -> None:
                             engine, memory_dir, permissions, quiet=True,
                             transcript_dir=_transcript_dir,
                             session_ids=_sids,
+                            rebuild_prompt=lambda: _compose_system_prompt(
+                                cwd=cwd,
+                                model=app_config.model,
+                                memory_dir=memory_dir,
+                                coordinator_enabled=is_coordinator_mode(),
+                                skills_section=skills_section,
+                                worker_tool_names=worker_tool_names,
+                                session_store=session_store,
+                            ),
                         )
                         release_lock(memory_dir)
                     except Exception:

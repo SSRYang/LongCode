@@ -3,6 +3,7 @@
 import os
 import platform
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -297,38 +298,117 @@ At the very end of your turn, once you are happy with your final plan file, call
 # Public API
 # ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class PromptSection:
+    name: str
+    content: str
+    stable: bool
+
+    @property
+    def char_count(self) -> int:
+        return len(self.content)
+
+
+def _build_prompt_sections(cwd: str, model: str = "", memory_dir: Path | None = None,
+                           working_memory: dict | None = None) -> list[PromptSection]:
+    sections = [
+        PromptSection("intro", _get_intro_section(), stable=True),
+        PromptSection("system", _get_system_section(), stable=True),
+        PromptSection("doing_tasks", _get_doing_tasks_section(), stable=True),
+        PromptSection("actions", _get_actions_section(), stable=True),
+        PromptSection("using_tools", _get_using_tools_section(), stable=True),
+        PromptSection("tone_and_style", _get_tone_and_style_section(), stable=True),
+        PromptSection("output_efficiency", _get_output_efficiency_section(), stable=True),
+        PromptSection("environment", _get_env_section(cwd, model), stable=False),
+        PromptSection("git", _get_git_section(cwd), stable=False),
+        PromptSection("claude_md", _get_claude_md_section(cwd), stable=False),
+    ]
+
+    if memory_dir is not None:
+        from features.memory import build_memory_system_section
+        sections.append(
+            PromptSection(
+                "memory_system",
+                build_memory_system_section(memory_dir),
+                stable=False,
+            )
+        )
+
+    if working_memory is not None:
+        from features.memory import build_working_memory_section
+        sections.append(
+            PromptSection(
+                "working_memory",
+                build_working_memory_section(working_memory),
+                stable=False,
+            )
+        )
+
+    companion_text = _get_companion_intro()
+    if companion_text:
+        sections.append(PromptSection("companion_intro", companion_text, stable=False))
+
+    return [section for section in sections if section.content]
+
+
+def build_system_prompt_layout(cwd: str | None = None, model: str = "", memory_dir: Path | None = None,
+                               working_memory: dict | None = None) -> dict:
+    cwd = cwd or str(Path.cwd())
+    sections = _build_prompt_sections(cwd, model=model, memory_dir=memory_dir,
+                                      working_memory=working_memory)
+
+    rendered_sections = [section.content for section in sections]
+    prompt = "\n\n".join(rendered_sections)
+
+    stable_prefix_sections: list[str] = []
+    dynamic_sections: list[str] = []
+    dynamic_started = False
+    for section in sections:
+        if section.stable and not dynamic_started:
+            stable_prefix_sections.append(section.content)
+            continue
+        dynamic_started = True
+        dynamic_sections.append(section.content)
+
+    stable_prefix = "\n\n".join(stable_prefix_sections)
+    dynamic_prompt = "\n\n".join(dynamic_sections)
+
+    section_meta = [
+        {
+            "name": section.name,
+            "stable": section.stable,
+            "char_count": section.char_count,
+        }
+        for section in sections
+    ]
+
+    return {
+        "prompt": prompt,
+        "stable_prefix": stable_prefix,
+        "sections": section_meta,
+        "stats": {
+            "section_count": len(sections),
+            "stable_section_count": sum(1 for section in sections if section.stable),
+            "dynamic_section_count": sum(1 for section in sections if not section.stable),
+            "total_chars": len(prompt),
+            "stable_chars": len(stable_prefix),
+            "dynamic_chars": len(dynamic_prompt),
+        },
+    }
+
+
 # 构建最终的系统提示词，从多个静态和动态部分组成
-def build_system_prompt(cwd: str | None = None, model: str = "", memory_dir: Path | None = None) -> str:
+def build_system_prompt(cwd: str | None = None, model: str = "", memory_dir: Path | None = None,
+                        working_memory: dict | None = None) -> str:
     """Assemble the full system prompt from section functions.
 
     Matches prompts.ts getSystemPrompt() architecture: static sections first,
     then dynamic sections.
     """
-    cwd = cwd or str(Path.cwd())
-
-    sections = [
-        # Static sections (correspond to TS cacheable sections)
-        _get_intro_section(),
-        _get_system_section(),
-        _get_doing_tasks_section(),
-        _get_actions_section(),
-        _get_using_tools_section(),
-        _get_tone_and_style_section(),
-        _get_output_efficiency_section(),
-        # Dynamic sections
-        _get_env_section(cwd, model),
-        _get_git_section(cwd),
-        _get_claude_md_section(cwd),
-    ]
-
-    # Memory system
-    if memory_dir is not None:
-        from features.memory import build_memory_system_section
-        sections.append(build_memory_system_section(memory_dir))
-
-    # Companion intro
-    companion_text = _get_companion_intro()
-    if companion_text:
-        sections.append(companion_text)
-
-    return "\n\n".join(s for s in sections if s)
+    return build_system_prompt_layout(
+        cwd=cwd,
+        model=model,
+        memory_dir=memory_dir,
+        working_memory=working_memory,
+    )["prompt"]
