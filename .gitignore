@@ -1,0 +1,76 @@
+# Python 编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE 特定文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+logs/
+
+# 测试相关
+.pytest_cache/
+.coverage
+htmlcov/
+.cov/
+.mypy_cache/
+
+# 环境变量文件
+.env
+.env.local
+.env.*.local
+
+# 用户配置文件
+.config/
+
+# 本地数据库文件
+*.db
+*.sqlite
+
+# 系统文件
+.DS_Store
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 项目特定忽略规则
+# 忽略根目录下除 README.md 外的所有 .md 文件
+*.md
+!README.md
+
+# 忽略指定目录
+学习/
+改造前体验基线/
