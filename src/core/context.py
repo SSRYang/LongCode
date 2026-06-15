@@ -352,11 +352,85 @@ def _build_prompt_sections(cwd: str, model: str = "", memory_dir: Path | None = 
     return [section for section in sections if section.content]
 
 
+def _truncate_section(content: str, max_chars: int) -> str:
+    if len(content) <= max_chars:
+        return content
+    return content[: max_chars - 3].rstrip() + "..."
+
+
+def _working_memory_summary_only(content: str) -> str:
+    lines: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lines.append(line)
+        if stripped.startswith("Summary:"):
+            break
+    return "\n".join(lines) if lines else content
+
+
+def _apply_section_budget(sections: list[PromptSection],
+                          max_dynamic_chars: int | None) -> tuple[list[PromptSection], list[dict]]:
+    if max_dynamic_chars is None:
+        return sections, []
+
+    reduced = list(sections)
+    reductions: list[dict] = []
+    dynamic_chars = sum(section.char_count for section in reduced if not section.stable)
+    reduction_steps = [
+        ("companion_intro", "drop", lambda content: ""),
+        ("git", "drop", lambda content: ""),
+        ("memory_system", "drop", lambda content: ""),
+        ("working_memory", "summary_only", _working_memory_summary_only),
+        ("claude_md", "truncate", lambda content: _truncate_section(content, 3000)),
+    ]
+
+    for name, action, reducer in reduction_steps:
+        if dynamic_chars <= max_dynamic_chars:
+            break
+        index = next(
+            (i for i, section in enumerate(reduced)
+             if section.name == name and not section.stable),
+            -1,
+        )
+        if index < 0:
+            continue
+
+        section = reduced[index]
+        new_content = reducer(section.content)
+        if new_content == section.content:
+            continue
+
+        if not new_content:
+            reduced.pop(index)
+            saved_chars = section.char_count
+        else:
+            replacement = PromptSection(section.name, new_content, stable=section.stable)
+            reduced[index] = replacement
+            saved_chars = section.char_count - replacement.char_count
+
+        if saved_chars <= 0:
+            continue
+
+        dynamic_chars -= saved_chars
+        reductions.append({
+            "name": section.name,
+            "action": action,
+            "saved_chars": saved_chars,
+        })
+
+    return [section for section in reduced if section.content], reductions
+
+
 def build_system_prompt_layout(cwd: str | None = None, model: str = "", memory_dir: Path | None = None,
-                               working_memory: dict | None = None) -> dict:
+                               working_memory: dict | None = None,
+                               max_dynamic_chars: int | None = None) -> dict:
     cwd = cwd or str(Path.cwd())
     sections = _build_prompt_sections(cwd, model=model, memory_dir=memory_dir,
                                       working_memory=working_memory)
+    raw_dynamic_chars = sum(section.char_count for section in sections if not section.stable)
+    sections, reductions = _apply_section_budget(sections, max_dynamic_chars)
 
     rendered_sections = [section.content for section in sections]
     prompt = "\n\n".join(rendered_sections)
@@ -387,6 +461,7 @@ def build_system_prompt_layout(cwd: str | None = None, model: str = "", memory_d
         "prompt": prompt,
         "stable_prefix": stable_prefix,
         "sections": section_meta,
+        "reductions": reductions,
         "stats": {
             "section_count": len(sections),
             "stable_section_count": sum(1 for section in sections if section.stable),
@@ -394,13 +469,17 @@ def build_system_prompt_layout(cwd: str | None = None, model: str = "", memory_d
             "total_chars": len(prompt),
             "stable_chars": len(stable_prefix),
             "dynamic_chars": len(dynamic_prompt),
+            "dynamic_chars_before_budget": raw_dynamic_chars,
+            "budget_target_chars": max_dynamic_chars,
+            "budget_saved_chars": max(0, raw_dynamic_chars - len(dynamic_prompt)),
         },
     }
 
 
 # 构建最终的系统提示词，从多个静态和动态部分组成
 def build_system_prompt(cwd: str | None = None, model: str = "", memory_dir: Path | None = None,
-                        working_memory: dict | None = None) -> str:
+                        working_memory: dict | None = None,
+                        max_dynamic_chars: int | None = None) -> str:
     """Assemble the full system prompt from section functions.
 
     Matches prompts.ts getSystemPrompt() architecture: static sections first,
@@ -411,4 +490,5 @@ def build_system_prompt(cwd: str | None = None, model: str = "", memory_dir: Pat
         model=model,
         memory_dir=memory_dir,
         working_memory=working_memory,
+        max_dynamic_chars=max_dynamic_chars,
     )["prompt"]

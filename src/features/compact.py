@@ -18,6 +18,7 @@ MIN_RECENT_MESSAGES = 6             # always keep at least this many messages
 MIN_RECENT_TOKENS = 10_000          # keep at least this many tokens of recent context
 COMPACT_MAX_OUTPUT_TOKENS = 4096
 AUTOCOMPACT_BUFFER_TOKENS = 13_000  # matches official autoCompact.ts
+SECTION_BUDGET_DYNAMIC_CHARS = 12_000
 
 # Model context windows (tokens).  First match wins.
 _CONTEXT_WINDOWS: list[tuple[str, int]] = [
@@ -49,6 +50,19 @@ def _auto_compact_threshold(model: str) -> int:
     cw = _context_window_for_model(model)
     max_out_reserve = min(20_000, cw // 5)  # reserve for summary output
     return cw - max_out_reserve - AUTOCOMPACT_BUFFER_TOKENS
+
+
+def section_budget_target_chars(model: str) -> int:
+    cw = _context_window_for_model(model)
+    return max(4000, min(SECTION_BUDGET_DYNAMIC_CHARS, cw // 20))
+
+
+def should_reduce_sections(model: str | None = None,
+                           last_input_tokens: int | None = None) -> bool:
+    if not model or not last_input_tokens:
+        return False
+    return last_input_tokens >= (_auto_compact_threshold(model) - AUTOCOMPACT_BUFFER_TOKENS)
+
 
 COMPACT_PROMPT = """\
 Please provide a detailed summary of our conversation so far.  This summary \

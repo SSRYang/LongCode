@@ -13,7 +13,7 @@ from prompt_toolkit.history import FileHistory
 from rich.console import Console
 
 from core.config import load_app_config
-from core.context import build_system_prompt
+from core.context import build_system_prompt, build_system_prompt_layout
 from core.engine import AbortedError, Engine
 from tools import AskUserQuestionTool
 from tools import AgentTool, SendMessageTool, TaskStopTool
@@ -36,7 +36,13 @@ from features.coordinator import (
 from features.cost_tracker import CostTracker
 from features.todo import TodoManager
 from core.session import SessionStore
-from features.compact import CompactService, estimate_tokens, should_compact
+from features.compact import (
+    CompactService,
+    estimate_tokens,
+    section_budget_target_chars,
+    should_compact,
+    should_reduce_sections,
+)
 from tui.keylistener import EscListener
 from core.permissions import PermissionChecker
 from features.agents import WorkerManager, EXPLORE_SYSTEM_PROMPT
@@ -111,19 +117,54 @@ def _run_dream(engine: Engine, memory_dir: Path,
 
 def _maybe_auto_compact(engine: Engine, compact_service: CompactService,
                         cost_tracker: CostTracker, model: str,
-                        console: Console) -> dict | None:
+                        console: Console,
+                        rebuild_prompt_with_budget: object | None = None) -> dict | None:
     messages = engine.get_messages()
+    info: dict[str, object] | None = None
+
+    if callable(rebuild_prompt_with_budget) and should_reduce_sections(
+        model=model,
+        last_input_tokens=cost_tracker.last_input_tokens,
+    ):
+        result = rebuild_prompt_with_budget(section_budget_target_chars(model))
+        layout = result.get("layout", {}) if isinstance(result, dict) else {}
+        reductions = layout.get("reductions", []) if isinstance(layout, dict) else []
+        if reductions:
+            saved_chars = int(layout.get("stats", {}).get("budget_saved_chars", 0))
+            dynamic_chars = int(layout.get("stats", {}).get("dynamic_chars", 0))
+            info = {
+                "triggered": False,
+                "status": "reduced",
+                "saved_chars": saved_chars,
+                "dynamic_chars": dynamic_chars,
+                "reductions": reductions,
+            }
+            reduced_sections = ", ".join(
+                f"{item['name']}:{item['action']}"
+                for item in reductions[:3]
+                if isinstance(item, dict)
+            )
+            console.print(
+                f"[dim]Reduced prompt sections before compact: {reduced_sections} "
+                f"(~{saved_chars:,} chars saved, dynamic ~{dynamic_chars:,} chars).[/dim]"
+            )
+            if not should_compact(messages, model=model,
+                                  last_input_tokens=cost_tracker.last_input_tokens):
+                return info
+
     if not should_compact(messages, model=model,
                           last_input_tokens=cost_tracker.last_input_tokens):
-        return None
+        return info
 
     pre_tokens = estimate_tokens(messages)
-    info = {
+    compact_info = {
         "triggered": True,
         "before_messages": len(messages),
         "before_tokens": pre_tokens,
         "status": "pending",
     }
+    if info:
+        compact_info["reduction"] = info
     console.print(
         f"[bold yellow]Notice:[/bold yellow] Auto-compacting conversation before the next turn. "
         f"({len(messages)} messages, ~{pre_tokens:,} tokens)"
@@ -132,7 +173,7 @@ def _maybe_auto_compact(engine: Engine, compact_service: CompactService,
         new_msgs, _ = compact_service.compact(messages, engine.system_prompt)
         engine.set_messages(new_msgs)
         post_tokens = estimate_tokens(new_msgs)
-        info.update({
+        compact_info.update({
             "status": "completed",
             "after_messages": len(new_msgs),
             "after_tokens": post_tokens,
@@ -142,9 +183,9 @@ def _maybe_auto_compact(engine: Engine, compact_service: CompactService,
             f"~{pre_tokens:,} → ~{post_tokens:,} tokens.[/dim]"
         )
     except Exception as e:
-        info.update({"status": "failed", "error": str(e)})
+        compact_info.update({"status": "failed", "error": str(e)})
         console.print(f"[dim red]Auto-compact failed: {e}[/dim red]")
-    return info
+    return compact_info
 
 
 def _load_working_memory(session_store: SessionStore | None) -> dict | None:
@@ -161,12 +202,14 @@ def _compose_system_prompt(
     skills_section: str,
     worker_tool_names: list[str],
     session_store: SessionStore | None,
+    max_dynamic_chars: int | None = None,
 ) -> str:
     prompt = build_system_prompt(
         cwd=cwd,
         model=model,
         memory_dir=memory_dir,
         working_memory=_load_working_memory(session_store),
+        max_dynamic_chars=max_dynamic_chars,
     )
     if skills_section:
         prompt += "\n\n" + skills_section
@@ -179,6 +222,56 @@ def _compose_system_prompt(
     return prompt
 
 
+def _build_prompt_layout(
+    cwd: str,
+    model: str,
+    memory_dir: Path,
+    session_store: SessionStore | None,
+    max_dynamic_chars: int | None = None,
+) -> dict:
+    return build_system_prompt_layout(
+        cwd=cwd,
+        model=model,
+        memory_dir=memory_dir,
+        working_memory=_load_working_memory(session_store),
+        max_dynamic_chars=max_dynamic_chars,
+    )
+
+
+def _rebuild_prompt_with_budget(
+    engine: Engine,
+    cwd: str,
+    model: str,
+    memory_dir: Path,
+    coordinator_enabled: bool,
+    skills_section: str,
+    worker_tool_names: list[str],
+    session_store: SessionStore | None,
+    max_dynamic_chars: int | None = None,
+) -> dict:
+    layout = _build_prompt_layout(
+        cwd=cwd,
+        model=model,
+        memory_dir=memory_dir,
+        session_store=session_store,
+        max_dynamic_chars=max_dynamic_chars,
+    )
+    prompt = layout["prompt"]
+    if skills_section:
+        prompt += "\n\n" + skills_section
+    if coordinator_enabled:
+        extra = get_coordinator_user_context(worker_tool_names)
+        worker_context = extra.get("workerToolsContext")
+        if worker_context:
+            prompt += "\n\n# Coordinator Context\n" + worker_context
+        prompt += "\n\n" + get_coordinator_system_prompt()
+    engine.system_prompt = prompt
+    return {
+        "prompt": prompt,
+        "layout": layout,
+    }
+
+
 def _refresh_system_prompt(
     engine: Engine,
     cwd: str,
@@ -189,7 +282,8 @@ def _refresh_system_prompt(
     worker_tool_names: list[str],
     session_store: SessionStore | None,
 ) -> str:
-    prompt = _compose_system_prompt(
+    result = _rebuild_prompt_with_budget(
+        engine,
         cwd=cwd,
         model=model,
         memory_dir=memory_dir,
@@ -198,8 +292,7 @@ def _refresh_system_prompt(
         worker_tool_names=worker_tool_names,
         session_store=session_store,
     )
-    engine.system_prompt = prompt
-    return prompt
+    return result["prompt"]
 
 
 def _update_working_memory(
@@ -780,6 +873,17 @@ def main() -> None:
             cost_tracker,
             app_config.model,
             console,
+            rebuild_prompt_with_budget=lambda max_dynamic_chars: _rebuild_prompt_with_budget(
+                engine,
+                cwd=cwd,
+                model=app_config.model,
+                memory_dir=memory_dir,
+                coordinator_enabled=is_coordinator_mode(),
+                skills_section=skills_section,
+                worker_tool_names=worker_tool_names,
+                session_store=session_store,
+                max_dynamic_chars=max_dynamic_chars,
+            ),
         )
 
         # Check if user is talking directly to companion — skip Claude, let

@@ -1,17 +1,17 @@
-"""Skill system — load, register, and execute SKILL.md-based skills.
+"""技能系统 —— 加载、注册并执行基于 SKILL.md 的技能。
 
-Modelled after claude-code's ``src/skills/loadSkillsDir.ts`` and
-``src/tools/SkillTool/SkillTool.ts``.
+参照 claude-code 的 src/skills/loadSkillsDir.ts 和
+src/tools/SkillTool/SkillTool.ts 设计。
 
-Skills are Markdown files with YAML frontmatter that define reusable prompts.
-They can be:
-  1. **Bundled** — registered in code via ``register_skill()``
-  2. **Project** — discovered from ``.cc-mini/skills/<name>/SKILL.md``
-  3. **User** — discovered from ``~/.cc-mini/skills/<name>/SKILL.md``
+技能是带有 YAML 前置元数据（frontmatter）的 Markdown 文件，用于定义可复用的提示词（prompts）。
+它们可以分为：
+  内置（Bundled） —— 通过 register_skill() 在代码中注册
+  项目级（Project） —— 从 .cc-mini/skills/<name>/SKILL.md 发现
+  用户级（User） —— 从 ~/.cc-mini/skills/<name>/SKILL.md 发现
 
-Execution modes:
-  - **inline** (default): prompt injected into current conversation
-  - **fork**: prompt runs in an isolated turn (messages saved/restored)
+执行模式：
+  内联（inline）（默认）：将提示词注入到当前对话中
+  分叉（fork）：提示词在隔离的回合中运行（消息会被保存/恢复）
 """
 
 from __future__ import annotations
@@ -29,27 +29,27 @@ from typing import Any, Callable
 @dataclass
 class Skill:
     """A single skill definition."""
-    name: str
-    description: str = ""
-    when_to_use: str = ""
-    user_invocable: bool = True
-    disable_model_invocation: bool = False
-    allowed_tools: list[str] = field(default_factory=list)
-    model: str | None = None
-    context: str = "inline"          # "inline" or "fork"
-    argument_hint: str = ""
-    paths: list[str] = field(default_factory=list)  # gitignore-style patterns
-    source: str = "project"          # "bundled", "project", "user"
-    skill_root: str | None = None    # base dir for $SKILL_DIR substitution
+    name: str                                    # 技能名称
+    description: str = ""                        # 技能描述
+    when_to_use: str = ""                        # 使用场景说明，描述何时应该使用此技能
+    user_invocable: bool = True                  # 是否允许用户直接调用此技能
+    disable_model_invocation: bool = False       # 是否禁用模型自动调用此技能
+    allowed_tools: list[str] = field(default_factory=list)  # 此技能允许使用的工具列表
+    model: str | None = None                     # 指定用于执行此技能的模型
+    context: str = "inline"                      # 执行上下文类型，"inline"(内联)或"fork"(分支)
+    argument_hint: str = ""                      # 调用此技能时参数的提示信息
+    paths: list[str] = field(default_factory=list)  # Git忽略风格的路径模式，用于指定技能相关的文件路径
+    source: str = "project"                      # 技能来源，"bundled"(捆绑的内置技能), "project"(项目技能), "user"(用户自定义技能)
+    skill_root: str | None = None                # 技能根目录，用于$SKILL_DIR变量替换的基础目录
 
     # The prompt content (body of SKILL.md, after frontmatter)
-    _prompt_text: str = ""
+    _prompt_text: str = ""                       # 提示内容（SKILL.md文件主体内容，去除前置元数据后）
     # Or a dynamic prompt generator (for bundled skills)
-    _prompt_fn: Callable[[str], str] | None = None
+    _prompt_fn: Callable[[str], str] | None = None  # 动态提示生成器（用于内置技能）
 
     def get_prompt(self, args: str = "") -> str:
         """Return the final prompt text, substituting variables."""
-        if self._prompt_fn is not None:
+        if self._prompt_fn is not None:                 # 如果有动态提示生成器，则使用它来生成提示文本
             return self._prompt_fn(args)
         text = self._prompt_text
         # Variable substitution (matches claude-code's processPromptSlashCommand)
@@ -57,7 +57,8 @@ class Skill:
         if self.skill_root:
             text = text.replace("${CLAUDE_SKILL_DIR}", self.skill_root)
         if args and self.argument_hint:
-            text = text.replace(f"${{{self.argument_hint}}}", args)
+            text = text.replace(f"${{{self.argument_hint}}}", args)     # 如果提供了参数且有参数提示，则替换特定的参数提示占位符
+
         return text
 
 
@@ -65,7 +66,14 @@ class Skill:
 # YAML frontmatter parser (minimal, no PyYAML dependency)
 # ---------------------------------------------------------------------------
 
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+# 文档前言部分（frontmatter）
+# 前言部分通常位于文档开头，以 "---" 开始和结束，中间包含YAML格式的元数据
+# 例如：
+# ---
+# title: 示例标题
+# author: 作者名
+# ---
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)   # 捕获两个 --- 之间所有的内容
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -78,9 +86,9 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     if not m:
         return {}, text
 
-    raw = m.group(1)
-    body = text[m.end():]
-    meta: dict[str, Any] = {}
+    raw = m.group(1)            # 捕获内容
+    body = text[m.end():]       # 匹配到的完整文本
+    meta: dict[str, Any] = {}   # 剩余部分
 
     for line in raw.splitlines():
         line = line.strip()
@@ -109,7 +117,7 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return meta, body
 
 
-def _ensure_str(val: Any, default: str = "") -> str:
+def _ensure_str(val: Any, default: str = "") -> str:    # 将给定的值转换为字符串，如果值是列表，则将列表元素用逗号连接后返回字符串
     """Coerce *val* to a string — rejoin lists produced by the frontmatter parser."""
     if val is None:
         return default
@@ -121,7 +129,12 @@ def _ensure_str(val: Any, default: str = "") -> str:
 def _skill_from_frontmatter(meta: dict[str, Any], body: str,
                              name: str, source: str,
                              skill_root: str | None = None) -> Skill:
-    """Build a ``Skill`` from parsed frontmatter and body text."""
+    """
+    Build a ``Skill`` from parsed frontmatter and body text.
+    在_parse_frontmatter之后处理
+    """
+
+    # 强制执行一次以逗号为分隔符的列表构建与空白符清理
     allowed = meta.get("allowed_tools", [])
     if isinstance(allowed, str):
         allowed = [t.strip() for t in allowed.split(",") if t.strip()]
@@ -187,22 +200,23 @@ def clear_skills(source: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 def load_skills_from_dir(skills_dir: Path, source: str = "project") -> list[Skill]:
-    """Scan *skills_dir* for ``<name>/SKILL.md`` and register each skill.
+    """
+        扫描 skills_dir 以查找 <name>/SKILL.md 并注册每个技能。
 
-    Matches claude-code's ``loadSkillsDir.ts`` directory-format loading:
-    only directories containing a ``SKILL.md`` file are recognised.
+        匹配 claude-code 的 loadSkillsDir.ts 目录格式加载逻辑：
+        仅识别包含 SKILL.md 文件的目录。
 
-    Also supports single ``.md`` files directly in the directory (legacy
-    ``/commands/`` format from claude-code).
+        同时支持直接位于该目录下的单个 .md 文件（兼容 claude-code 遗留的
+        /commands/ 格式）。
     """
     loaded: list[Skill] = []
     if not skills_dir.is_dir():
         return loaded
 
-    for entry in sorted(skills_dir.iterdir()):
+    for entry in sorted(skills_dir.iterdir()):  # 对目录下的子项进行遍历
         skill = None
         if entry.is_dir():
-            skill_md = entry / "SKILL.md"
+            skill_md = entry / "SKILL.md"       # 探寻子目录下的 SKILL.md 文件
             if not skill_md.exists():
                 # Fallback: look for any .md file in the directory
                 md_files = list(entry.glob("*.md"))
@@ -221,7 +235,7 @@ def load_skills_from_dir(skills_dir: Path, source: str = "project") -> list[Skil
                 source=source,
                 skill_root=str(entry),
             )
-        elif entry.suffix == ".md" and entry.is_file():
+        elif entry.suffix == ".md" and entry.is_file(): # 当遍历到的 entry 是一个文件且后缀为 .md
             # Legacy single-file format
             try:
                 text = entry.read_text(encoding="utf-8")
@@ -254,11 +268,11 @@ def discover_skills(cwd: str | None = None) -> list[Skill]:
     """
     loaded: list[Skill] = []
 
-    # User-level skills
+    # 用户级技能
     user_dir = Path.home() / ".cc-mini" / "skills"
     loaded.extend(load_skills_from_dir(user_dir, source="user"))
 
-    # Project-level skills
+    # 项目级技能
     if cwd:
         project_dir = Path(cwd) / ".cc-mini" / "skills"
         loaded.extend(load_skills_from_dir(project_dir, source="project"))
@@ -276,7 +290,7 @@ def build_skills_prompt_section() -> str:
     Matches claude-code's ``SkillTool/prompt.ts`` — lists available skills
     so the model knows what it can invoke via ``/skill-name``.
     """
-    skills = list_skills(user_invocable_only=False)
+    skills = list_skills(user_invocable_only=False) # 从全局注册表中提取所有当前可用的技能实例，参数设定为 False，意味着它将提取所有注册的技能，无论其是否配置为仅供用户手动触发。
     if not skills:
         return ""
 

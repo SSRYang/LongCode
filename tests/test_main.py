@@ -156,6 +156,10 @@ def test_maybe_auto_compact_announces_and_compresses(monkeypatch):
     compact_service = DummyCompactService(new_messages)
 
     monkeypatch.setattr(
+        "tui.app.should_reduce_sections",
+        lambda model, last_input_tokens: False,
+    )
+    monkeypatch.setattr(
         "tui.app.should_compact",
         lambda messages, model, last_input_tokens: True,
     )
@@ -182,6 +186,160 @@ def test_maybe_auto_compact_announces_and_compresses(monkeypatch):
         "status": "completed",
         "after_messages": 1,
         "after_tokens": 456,
+    }
+
+
+def test_maybe_auto_compact_reduces_sections_before_compacting(monkeypatch):
+    from io import StringIO
+    from types import SimpleNamespace
+
+    from rich.console import Console
+
+    from tui.app import _maybe_auto_compact
+
+    class DummyEngine:
+        def __init__(self, messages):
+            self._messages = messages
+            self.system_prompt = "system"
+
+        def get_messages(self):
+            return self._messages
+
+        def set_messages(self, messages):
+            self._messages = messages
+
+    class DummyCompactService:
+        def __init__(self, new_messages):
+            self.new_messages = new_messages
+            self.called_with = None
+
+        def compact(self, messages, system_prompt):
+            self.called_with = (messages, system_prompt)
+            return self.new_messages, "summary"
+
+    engine = DummyEngine([
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "world"},
+    ])
+    compact_service = DummyCompactService([{"role": "assistant", "content": "summary"}])
+
+    monkeypatch.setattr("tui.app.should_reduce_sections", lambda model, last_input_tokens: True)
+    monkeypatch.setattr("tui.app.section_budget_target_chars", lambda model: 5000)
+    compact_checks = iter([True, True])
+    monkeypatch.setattr(
+        "tui.app.should_compact",
+        lambda messages, model, last_input_tokens: next(compact_checks),
+    )
+    token_counts = iter([1234, 456])
+    monkeypatch.setattr("tui.app.estimate_tokens", lambda messages: next(token_counts))
+
+    rebuild_calls = []
+
+    def rebuild_prompt_with_budget(max_dynamic_chars):
+        rebuild_calls.append(max_dynamic_chars)
+        return {
+            "prompt": "reduced prompt",
+            "layout": {
+                "reductions": [{"name": "git", "action": "drop", "saved_chars": 1000}],
+                "stats": {"budget_saved_chars": 1000, "dynamic_chars": 4200},
+            },
+        }
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    cost_tracker = SimpleNamespace(last_input_tokens=1500)
+
+    info = _maybe_auto_compact(
+        engine,
+        compact_service,
+        cost_tracker,
+        "test-model",
+        console,
+        rebuild_prompt_with_budget=rebuild_prompt_with_budget,
+    )
+
+    rendered = output.getvalue()
+    assert rebuild_calls == [5000]
+    assert "Reduced prompt sections before compact" in rendered
+    assert info["reduction"]["status"] == "reduced"
+    assert info["reduction"]["reductions"][0]["name"] == "git"
+    assert compact_service.called_with == (engine.get_messages(), "system") or compact_service.called_with == ([
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "world"},
+    ], "system")
+
+
+def test_maybe_auto_compact_can_stop_after_section_reduction(monkeypatch):
+    from io import StringIO
+    from types import SimpleNamespace
+
+    from rich.console import Console
+
+    from tui.app import _maybe_auto_compact
+
+    class DummyEngine:
+        def __init__(self, messages):
+            self._messages = messages
+            self.system_prompt = "system"
+
+        def get_messages(self):
+            return self._messages
+
+        def set_messages(self, messages):
+            self._messages = messages
+
+    class DummyCompactService:
+        def __init__(self):
+            self.called_with = None
+
+        def compact(self, messages, system_prompt):
+            self.called_with = (messages, system_prompt)
+            return messages, "summary"
+
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "world"},
+    ]
+    engine = DummyEngine(messages)
+    compact_service = DummyCompactService()
+
+    monkeypatch.setattr("tui.app.should_reduce_sections", lambda model, last_input_tokens: True)
+    monkeypatch.setattr("tui.app.section_budget_target_chars", lambda model: 5000)
+    compact_checks = iter([False])
+    monkeypatch.setattr(
+        "tui.app.should_compact",
+        lambda messages, model, last_input_tokens: next(compact_checks),
+    )
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    cost_tracker = SimpleNamespace(last_input_tokens=1500)
+
+    info = _maybe_auto_compact(
+        engine,
+        compact_service,
+        cost_tracker,
+        "test-model",
+        console,
+        rebuild_prompt_with_budget=lambda max_dynamic_chars: {
+            "prompt": "reduced prompt",
+            "layout": {
+                "reductions": [{"name": "git", "action": "drop", "saved_chars": 1000}],
+                "stats": {"budget_saved_chars": 1000, "dynamic_chars": 4200},
+            },
+        },
+    )
+
+    rendered = output.getvalue()
+    assert "Reduced prompt sections before compact" in rendered
+    assert "Auto-compacting conversation before the next turn." not in rendered
+    assert compact_service.called_with is None
+    assert info == {
+        "triggered": False,
+        "status": "reduced",
+        "saved_chars": 1000,
+        "dynamic_chars": 4200,
+        "reductions": [{"name": "git", "action": "drop", "saved_chars": 1000}],
     }
 
 

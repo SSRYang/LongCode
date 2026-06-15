@@ -230,3 +230,41 @@ def test_build_system_prompt_layout_includes_working_memory_section():
     names = [section["name"] for section in layout["sections"]]
     assert names[-1] == "working_memory"
     assert "# Working Memory" in layout["prompt"]
+
+
+def test_build_system_prompt_layout_applies_section_budget():
+    fake_result = MagicMock()
+    fake_result.stdout = "feature-branch\nM file.py\nabc1234 some commit"
+    fake_result.returncode = 0
+
+    claude_text = "# Test Project\n" + ("instruction\n" * 800)
+    working_memory = {
+        "summary": "User: ask cache | Assistant: answered",
+        "carry_forwards": ["worker finished indexing"] * 6,
+        "recent_messages": [
+            {"role": "user", "text": "ask cache"},
+            {"role": "assistant", "text": "answered"},
+        ] * 4,
+    }
+
+    with patch("core.context.subprocess.run", return_value=fake_result), \
+         patch("core.context._get_claude_md_section", return_value=claude_text), \
+         patch("core.context._get_companion_intro", return_value="buddy notes"), \
+         patch("features.memory.build_memory_system_section", return_value="memory system\n" * 120):
+        layout = build_system_prompt_layout(
+            cwd="/tmp/project",
+            model="test-model",
+            working_memory=working_memory,
+            memory_dir=MagicMock(),
+            max_dynamic_chars=3500,
+        )
+
+    section_names = [section["name"] for section in layout["sections"]]
+    reduction_names = [item["name"] for item in layout["reductions"]]
+    assert "companion_intro" not in section_names
+    assert "git" not in section_names
+    assert reduction_names[:3] == ["companion_intro", "git", "memory_system"]
+    assert layout["stats"]["budget_target_chars"] == 3500
+    assert layout["stats"]["budget_saved_chars"] > 0
+    assert layout["stats"]["dynamic_chars"] <= layout["stats"]["dynamic_chars_before_budget"]
+    assert any(section["name"] == "working_memory" for section in layout["sections"])
