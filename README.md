@@ -6,7 +6,7 @@ LongCode 是一个面向长链路代码开发任务的 AI Coding 助手。它基
 
 ## 项目定位
 
-LongCode 不是只做单轮问答的命令行聊天工具，而是一个带有工具、会话、记忆和上下文预算的本地 Coding Agent。它的目标是让长任务能被持续推进，并且让每一轮执行都能被复盘。
+LongCode 是一个带有工具、会话、记忆和上下文预算的本地 Coding Agent。它的目标是让长任务能被持续推进，并且让每一轮执行都能被观测、复盘。
 
 ```mermaid
 flowchart LR
@@ -37,7 +37,7 @@ flowchart LR
 | Coordinator / Agent | 支持后台 worker、Explore agent 和任务通知 | `src/features/agents/` |
 | Sandbox | 支持 Bash 沙箱配置和权限控制 | `src/features/sandbox/` |
 | Skills | 支持内置技能和项目 / 用户技能发现 | `src/features/skills.py` |
-| Buddy | 带有桌宠反馈、心情和小游戏扩展 | `src/buddy/` |
+
 
 ## 主链路
 
@@ -69,7 +69,6 @@ sequenceDiagram
     App->>Engine: 刷新 system prompt
 ```
 
-这条链路最值得先学，因为它串起了项目的大部分核心概念：输入解析、模型调用、工具执行、事件渲染、会话保存、短期记忆和上下文治理。
 
 ## 上下文治理
 
@@ -91,8 +90,6 @@ flowchart TD
 1. **Session JSONL** 保存完整会话，方便恢复和审计。
 2. **Working Memory** 保存当前任务的短期摘要，避免每轮都重新依赖完整历史。
 3. **Section Budget** 在 compact 前优先缩减低优先级动态 section，减少不必要的整体压缩。
-
-## 关键术语
 
 ### working-memory
 
@@ -135,11 +132,11 @@ flowchart TD
 
 `stable prefix` 是 prompt 中开头连续稳定的 section。它通常不随目录、Git 状态或 memory 变化而变化。
 
-这个结构为后续显式 prompt caching 提供基础。当前项目已经具备可缓存结构，但是否真正提升 API cache 命中率，还取决于 provider 调用层是否接入显式缓存参数。
+这个结构为后续显式 prompt caching 提供基础。当前项目已经具备可缓存结构，但是否真正提升 API cache 命中率，需要进一步开发准备（调用层的缓存参数）
 
 ### turn artifact
 
-`turn artifact` 是单轮执行证据。它记录一轮请求中的关键数据：
+`turn artifact` 是单轮执行证据，记录一轮请求中的关键数据：
 
 - 输入预览
 - assistant 输出预览
@@ -180,10 +177,8 @@ src/
   tools/           # Read、Edit、Write、Glob、Grep、Bash、Agent 等工具
   features/        # compact、memory、cost、plan、skills、sandbox、agents
   commands/        # slash command 解析与执行
-  buddy/           # 桌宠、心情、小游戏扩展
 tests/             # pytest 测试
 assets/            # README 和展示图片
-学习/              # 学习笔记和二次开发参考资料
 ```
 
 ## 安装与运行
@@ -389,43 +384,3 @@ python -m pytest -q tests/test_session_mode.py tests/test_engine.py tests/test_c
 
 已知 warning 来自 `.pytest_cache` 写入权限，不影响功能。
 
-## 学习路线
-
-建议按这条顺序阅读源码：
-
-```mermaid
-flowchart TD
-    A[src/tui/app.py] --> B[src/tui/query.py]
-    B --> C[src/core/engine.py]
-    C --> D[src/tools/]
-    C --> E[src/core/session.py]
-    E --> F[src/features/memory.py]
-    F --> G[src/core/context.py]
-    G --> H[src/features/compact.py]
-```
-
-阅读重点：
-
-1. `src/tui/app.py`：理解启动、REPL、命令分发和每轮后处理。
-2. `src/tui/query.py`：理解如何消费 `Engine.submit()` 的事件流。
-3. `src/core/engine.py`：理解模型调用、工具调用和消息状态变化。
-4. `src/core/session.py`：理解 session 如何持久化。
-5. `src/features/memory.py`：理解长期 memory 和 working-memory。
-6. `src/core/context.py`：理解 prompt section 和 stable prefix。
-7. `src/features/compact.py`：理解 compact 阈值、摘要和上下文预算。
-
-## 二次开发阶段成果
-
-| 阶段 | 成果 | 可证明方式 |
-| --- | --- | --- |
-| Phase 1 | 单轮执行证据链 | turn artifact 可回看 |
-| Phase 2 | Prompt section 化 | `build_system_prompt_layout()` 输出 metadata |
-| Phase 3 | Working Memory | session 生成 `*.working-memory.json` |
-| Phase 4 | Section 级预算 | compact 前先记录 section reduction |
-
-## 项目边界
-
-- 这是学习和实验项目，不建议直接作为生产级 Coding Agent 使用。
-- 当前已具备 prompt caching 的结构基础，但没有声明已经提升真实 API cache 命中率。
-- `section budget` 优先治理 system prompt 动态区，不会破坏工具调用消息中的 `tool_use` / `tool_result` 配对。
-- `compact` 仍保留为最后压缩手段，用于处理真正接近上下文上限的长会话。

@@ -35,6 +35,7 @@ venv.bak/
 *~
 .DS_Store
 Thumbs.db
+src/buddy/
 
 # 日志文件
 *.log
@@ -74,3 +75,4 @@ Thumbs.db
 # 忽略指定目录
 学习/
 改造前体验基线/
+src/buddy/
