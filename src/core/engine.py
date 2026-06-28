@@ -1,8 +1,10 @@
 from __future__ import annotations
+import json
 import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 from .config import DEFAULT_MODEL, default_max_tokens_for_model, resolve_model
 from .llm import LLMClient
@@ -17,6 +19,11 @@ _MAX_RETRIES = 10 #  最大重试次数常量
 _BASE_DELAY = 0.5 #  基础延迟时间常量（秒）
 _MAX_DELAY = 32.0 #  最大延迟时间常量（秒）
 _JITTER_FACTOR = 0.25 #  抖动因子常量，用于在重试延迟中引入随机性
+_MAX_TOOL_RESULT_CHARS = 12_000
+_TOOL_RESULT_HEAD_CHARS = 8_000
+_TOOL_RESULT_TAIL_CHARS = 3_000
+_TOOL_RESULT_DIAGNOSTIC_MARKERS = ("[stderr]", "Traceback", "[exit code:", "Error:")
+_TOOL_RESULT_TRUNCATION_TEMPLATE = "\n\n... (tool result truncated, showing first {head} characters and a diagnostic tail segment; original length {original})"
 
 
 def _compute_retry_delay(attempt: int, retry_after: float | None = None) -> float:  # 计算重试延迟时间, 默认指数退避策略，或采用retry_after
@@ -347,10 +354,14 @@ class Engine:
                     break
 
                 tool_results = []
+                duplicate_results = self._build_duplicate_results(tool_uses)
 
                 # 将工具调用分批：连续的只读工具并行执行，非只读工具单独执行
                 batches: list[list] = []    # [(布尔值, [工具调用对象列表]), ...]，其中布尔值代表该批次是否支持并发。
                 for tu in tool_uses:
+                    if _block_id(tu) in duplicate_results:
+                        batches.append((False, [tu]))
+                        continue
                     t = self._tools.get(_block_name(tu))
                     is_concurrent = t is not None and t.is_read_only()  # 只读工具
                     if batches and batches[-1][0] == is_concurrent and is_concurrent:   # 当前工具是只读的，且与上一个批次的并发属性一致。
@@ -362,6 +373,18 @@ class Engine:
                     if self._aborted:
                         raise AbortedError()
 
+                    if len(batch) == 1 and _block_id(batch[0]) in duplicate_results:
+                        tu = batch[0]
+                        tn = _block_name(tu)
+                        ti = _block_input(tu)
+                        tool = self._tools.get(tn)
+                        act = self._safe_activity_description(tool, ti)
+                        result = duplicate_results[_block_id(tu)]
+                        yield ("tool_call", tn, ti, act)
+                        yield ("tool_result", tn, ti, result)
+                        tool_results.append(_tool_result_block(_block_id(tu), result))
+                        continue
+
                     if is_concurrent and len(batch) > 1:
                         # --- parallel execution for read-only tools ---
                         # Phase 1: emit tool_call events + check permissions
@@ -371,11 +394,16 @@ class Engine:
                             tn = _block_name(tu)
                             ti = _block_input(tu)
                             tool = self._tools.get(tn)
-                            act = tool.get_activity_description(**ti) if tool else None
+                            act = self._safe_activity_description(tool, ti)
                             yield ("tool_call", tn, ti, act)
-                            if tool and self._permissions.check(tool, ti) == "deny":
-                                denied_results[_block_id(tu)] = ToolResult(
-                                    content="Permission denied.", is_error=True)
+                            preflight = self._preflight_tool_use(tool, tn, ti)
+                            if preflight is not None:
+                                denied_results[_block_id(tu)] = preflight
+                            elif self._permissions.check(tool, ti) == "deny":
+                                denied_results[_block_id(tu)] = self._normalize_tool_result(
+                                    tn,
+                                    ToolResult(content="Permission denied.", is_error=True),
+                                )
                             else:
                                 approved.append((tu, tool, act))
 
@@ -397,8 +425,10 @@ class Engine:
                                     try:
                                         executed_results[_block_id(tu)] = f.result()
                                     except Exception as exc:
-                                        executed_results[_block_id(tu)] = ToolResult(
-                                            content=f"Tool execution error: {exc}", is_error=True)
+                                        executed_results[_block_id(tu)] = self._normalize_tool_result(
+                                            _block_name(tu),
+                                            ToolResult(content=f"Error: Tool execution failed for {_block_name(tu)}: {exc}", is_error=True),
+                                        )
 
                         # Phase 3: emit results in original batch order
                         for tu in batch:
@@ -407,14 +437,12 @@ class Engine:
                             ti = _block_input(tu)
                             result = denied_results.get(tid) or executed_results.get(tid)   # 按调用顺序输出结果
                             if result is None:
-                                result = ToolResult(content="No result", is_error=True)
+                                result = self._normalize_tool_result(
+                                    tn,
+                                    ToolResult(content=f"Error: Tool execution failed for {tn}: no result returned.", is_error=True),
+                                )
                             yield ("tool_result", tn, ti, result)
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tid,
-                                "content": result.content,
-                                "is_error": result.is_error,
-                            })
+                            tool_results.append(_tool_result_block(tid, result))
                     else:   # 串行执行
                         # --- sequential execution (single tool or non-read-only) ---
                         for tu in batch:
@@ -423,22 +451,23 @@ class Engine:
                             tn = _block_name(tu)
                             ti = _block_input(tu)
                             tool = self._tools.get(tn)
-                            act = tool.get_activity_description(**ti) if tool else None
+                            act = self._safe_activity_description(tool, ti)
                             yield ("tool_call", tn, ti, act)
 
-                            if tool and self._permissions.check(tool, ti) == "deny":
-                                result = ToolResult(content="Permission denied.", is_error=True)
+                            preflight = self._preflight_tool_use(tool, tn, ti)
+                            if preflight is not None:
+                                result = preflight
+                            elif self._permissions.check(tool, ti) == "deny":
+                                result = self._normalize_tool_result(
+                                    tn,
+                                    ToolResult(content="Permission denied.", is_error=True),
+                                )
                             else:
                                 yield ("tool_executing", tn, ti, act)
                                 result = self._execute_tool(tu, skip_permission=True)
 
                             yield ("tool_result", tn, ti, result)
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": _block_id(tu),
-                                "content": result.content,
-                                "is_error": result.is_error,
-                            })
+                            tool_results.append(_tool_result_block(_block_id(tu), result))
 
                 self._messages.append({
                     "role": "user",
@@ -449,15 +478,94 @@ class Engine:
             self.cancel_turn()
             raise
 
+    def _build_duplicate_results(self, tool_uses: list[Any]) -> dict[str, ToolResult]:
+        seen: dict[str, str] = {}
+        duplicates: dict[str, ToolResult] = {}
+        for tool_use in tool_uses:
+            tool_name = _block_name(tool_use)
+            tool_input = _block_input(tool_use)
+            fingerprint = _tool_call_fingerprint(tool_name, tool_input)
+            tool_use_id = _block_id(tool_use)
+            if fingerprint in seen:
+                duplicates[tool_use_id] = self._normalize_tool_result(
+                    tool_name,
+                    ToolResult(
+                        content=(
+                            f"Error: Duplicate tool call blocked for {tool_name} "
+                            "with identical input in the same assistant response."
+                        ),
+                        is_error=True,
+                    ),
+                )
+            else:
+                seen[fingerprint] = tool_use_id
+        return duplicates
+
+    def _preflight_tool_use(self, tool: Tool | None, tool_name: str, tool_input: dict[str, Any]) -> ToolResult | None:
+        if tool is None:
+            return self._normalize_tool_result(
+                tool_name,
+                ToolResult(content=f"Error: Unknown tool: {tool_name}", is_error=True),
+            )
+
+        validation_error = tool.validate_input(tool_input)
+        if validation_error is not None:
+            return self._normalize_tool_result(
+                tool_name,
+                ToolResult(
+                    content=f"Error: Invalid input for {tool_name}: {validation_error}.",
+                    is_error=True,
+                ),
+            )
+        return None
+
+    def _safe_activity_description(self, tool: Tool | None, tool_input: dict[str, Any]) -> str | None:
+        if tool is None:
+            return None
+        try:
+            return tool.get_activity_description(**tool_input)
+        except Exception:
+            return None
+
+    def _normalize_tool_result(self, tool_name: str, result: ToolResult) -> ToolResult:
+        content = result.content
+        if isinstance(content, str):
+            text = content
+        elif content is None:
+            text = ""
+        else:
+            text = json.dumps(content, ensure_ascii=False)
+
+        text = text.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+        if not text:
+            text = "(no output)"
+
+        if len(text) > _MAX_TOOL_RESULT_CHARS:
+            head = text[:_TOOL_RESULT_HEAD_CHARS]
+            tail = _diagnostic_tail_segment(text)
+            marker = _TOOL_RESULT_TRUNCATION_TEMPLATE.format(
+                head=_TOOL_RESULT_HEAD_CHARS,
+                original=len(text),
+            )
+            text = head + marker + "\n\n" + tail
+
+        return ToolResult(content=text, is_error=result.is_error)
+
     def _execute_tool(self, tool_use, skip_permission: bool = False) -> ToolResult:
         tool_name = _block_name(tool_use)
         tool_input = _block_input(tool_use)
         tool = self._tools.get(tool_name)
-        if tool is None:
-            return ToolResult(content=f"Unknown tool: {tool_name}", is_error=True)
+        preflight = self._preflight_tool_use(tool, tool_name, tool_input)
+        if preflight is not None:
+            return preflight
+
+        assert tool is not None
 
         if not skip_permission and self._permissions.check(tool, tool_input) == "deny":
-            return ToolResult(content="Permission denied.", is_error=True)
+            return self._normalize_tool_result(
+                tool_name,
+                ToolResult(content="Permission denied.", is_error=True),
+            )
 
         try:
             # Snapshot file for diff if it's a write tool we want to track
@@ -465,7 +573,6 @@ class Engine:
             if self._cost_tracker and tool_name in ("Edit", "Write"):
                 fp = tool_input.get("file_path", "")
                 try:
-                    from pathlib import Path
                     p = Path(fp)
                     old_lines = p.read_text().splitlines() if p.exists() else []
                 except Exception:
@@ -477,7 +584,6 @@ class Engine:
             if self._cost_tracker and old_lines is not None and not result.is_error:
                 fp = tool_input.get("file_path", "")
                 try:
-                    from pathlib import Path
                     new_lines = Path(fp).read_text().splitlines()
                     added = max(len(new_lines) - len(old_lines), 0)
                     removed = max(len(old_lines) - len(new_lines), 0)
@@ -485,9 +591,37 @@ class Engine:
                 except Exception:
                     pass
 
-            return result
+            return self._normalize_tool_result(tool_name, result)
         except Exception as e:
-            return ToolResult(content=f"Tool error: {e}", is_error=True)
+            return self._normalize_tool_result(
+                tool_name,
+                ToolResult(content=f"Error: Tool execution failed for {tool_name}: {e}", is_error=True),
+            )
+
+
+def _tool_result_block(tool_use_id: str, result: ToolResult) -> dict[str, Any]:
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": result.content,
+        "is_error": result.is_error,
+    }
+
+
+def _tool_call_fingerprint(tool_name: str, tool_input: dict[str, Any]) -> str:
+    try:
+        normalized = json.dumps(tool_input, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        normalized = repr(tool_input)
+    return f"{tool_name}:{normalized}"
+
+
+def _diagnostic_tail_segment(text: str) -> str:
+    for marker in _TOOL_RESULT_DIAGNOSTIC_MARKERS:
+        index = text.rfind(marker)
+        if index != -1:
+            return text[index:]
+    return text[-_TOOL_RESULT_TAIL_CHARS:]
 
 
 def _block_type(block: Any) -> str | None:

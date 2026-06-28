@@ -297,3 +297,247 @@ def test_engine_handles_mid_stream_error():
 
     text_events = [e for e in events if e[0] == "text"]
     assert any("success" in e[1] for e in text_events)
+
+
+class EchoLongTool(Tool):
+    name = "EchoLong"
+    description = "Returns a long payload"
+    input_schema = {
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "required": ["message"],
+    }
+
+    def execute(self, message: str) -> ToolResult:
+        return ToolResult(content=message)
+
+
+class CountingEchoTool(Tool):
+    name = "Echo"
+    description = "Returns the input message and counts calls"
+    input_schema = {
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "required": ["message"],
+    }
+
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self, message: str) -> ToolResult:
+        self.calls += 1
+        return ToolResult(content=f"Echo: {message}")
+
+
+class NestedSchemaTool(Tool):
+    name = "Nested"
+    description = "Validates nested schema"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "options": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string"},
+                                    "description": {"type": "string"},
+                                },
+                                "required": ["label", "description"],
+                            },
+                            "minItems": 2,
+                            "maxItems": 4,
+                        },
+                    },
+                    "required": ["question", "options"],
+                },
+                "minItems": 1,
+                "maxItems": 4,
+            }
+        },
+        "required": ["questions"],
+    }
+
+    def execute(self, questions: list) -> ToolResult:
+        return ToolResult(content=f"questions={len(questions)}")
+
+
+def _make_engine_with_tools(*tools):
+    return Engine(
+        tools=list(tools),
+        system_prompt="You are a test assistant.",
+        permission_checker=PermissionChecker(auto_approve=True),
+    )
+
+
+def _make_tool_use_message(tool_uses):
+    from core.llm import LLMMessage, LLMUsage
+
+    final_msg = LLMMessage(content=tool_uses, usage=LLMUsage())
+    stream = MagicMock()
+    stream.__enter__ = MagicMock(return_value=stream)
+    stream.__exit__ = MagicMock(return_value=False)
+    stream.text_stream = iter([])
+    stream.get_final_message = MagicMock(return_value=final_msg)
+    return stream
+
+
+def test_engine_rejects_missing_required_tool_input():
+    engine = _make_engine()
+    streams = _make_tool_then_text_response("Echo", {}, "tu_missing", "done")
+
+    with patch.object(engine._client, "stream_messages", side_effect=streams):
+        events = list(engine.submit("use echo"))
+
+    tool_result = [e for e in events if e[0] == "tool_result"][0][3]
+    assert tool_result.is_error
+    assert "Invalid input for Echo" in tool_result.content
+    assert "missing required field 'message'" in tool_result.content
+
+
+def test_engine_rejects_unexpected_tool_input_field():
+    engine = _make_engine()
+    streams = _make_tool_then_text_response(
+        "Echo",
+        {"message": "hi", "extra": True},
+        "tu_extra",
+        "done",
+    )
+
+    with patch.object(engine._client, "stream_messages", side_effect=streams):
+        events = list(engine.submit("use echo"))
+
+    tool_result = [e for e in events if e[0] == "tool_result"][0][3]
+    assert tool_result.is_error
+    assert "unexpected field 'extra'" in tool_result.content
+
+
+def test_engine_rejects_invalid_enum_tool_input():
+    from tools.todo import TodoUpdateTool
+    from features.todo import TodoManager
+
+    engine = _make_engine_with_tools(TodoUpdateTool(TodoManager()))
+    streams = _make_tool_then_text_response(
+        "TodoUpdate",
+        {"id": "1", "status": "paused"},
+        "tu_enum",
+        "done",
+    )
+
+    with patch.object(engine._client, "stream_messages", side_effect=streams):
+        events = list(engine.submit("update todo"))
+
+    tool_result = [e for e in events if e[0] == "tool_result"][0][3]
+    assert tool_result.is_error
+    assert "expected one of ['pending', 'in_progress', 'completed']" in tool_result.content
+
+
+def test_engine_validates_nested_array_object_input():
+    engine = _make_engine_with_tools(NestedSchemaTool())
+    streams = _make_tool_then_text_response(
+        "Nested",
+        {
+            "questions": [{
+                "question": "q1",
+                "options": [{"label": "a", "description": "A"}],
+            }],
+        },
+        "tu_nested",
+        "done",
+    )
+
+    with patch.object(engine._client, "stream_messages", side_effect=streams):
+        events = list(engine.submit("use nested"))
+
+    tool_result = [e for e in events if e[0] == "tool_result"][0][3]
+    assert tool_result.is_error
+    assert "expected at least 2 items for 'questions[0].options'" in tool_result.content
+
+
+def test_engine_blocks_duplicate_tool_calls_in_same_turn():
+    tool = CountingEchoTool()
+    engine = _make_engine_with_tools(tool)
+    first_stream = _make_tool_use_message([
+        {"type": "tool_use", "id": "tu_1", "name": "Echo", "input": {"message": "same"}},
+        {"type": "tool_use", "id": "tu_2", "name": "Echo", "input": {"message": "same"}},
+    ])
+    second_stream = _make_text_response("done")
+
+    with patch.object(engine._client, "stream_messages", side_effect=[first_stream, second_stream]) as stream:
+        events = list(engine.submit("use echo twice"))
+
+    tool_results = [e for e in events if e[0] == "tool_result"]
+    assert len(tool_results) == 2
+    assert tool.calls == 1
+    assert tool_results[0][3].is_error is False
+    assert tool_results[1][3].is_error is True
+    assert "Duplicate tool call blocked for Echo" in tool_results[1][3].content
+
+    second_messages = stream.call_args_list[1].kwargs["messages"]
+    tool_result_message = second_messages[2]
+    assert tool_result_message["content"][1]["is_error"] is True
+    assert "Duplicate tool call blocked for Echo" in tool_result_message["content"][1]["content"]
+
+
+def test_engine_allows_same_tool_with_different_inputs():
+    tool = CountingEchoTool()
+    engine = _make_engine_with_tools(tool)
+    first_stream = _make_tool_use_message([
+        {"type": "tool_use", "id": "tu_1", "name": "Echo", "input": {"message": "one"}},
+        {"type": "tool_use", "id": "tu_2", "name": "Echo", "input": {"message": "two"}},
+    ])
+    second_stream = _make_text_response("done")
+
+    with patch.object(engine._client, "stream_messages", side_effect=[first_stream, second_stream]):
+        events = list(engine.submit("use echo twice"))
+
+    tool_results = [e for e in events if e[0] == "tool_result"]
+    assert len(tool_results) == 2
+    assert tool.calls == 2
+    assert all(result[3].is_error is False for result in tool_results)
+
+
+def test_engine_truncates_long_tool_results_before_follow_up_request():
+    engine = _make_engine_with_tools(EchoLongTool())
+    long_message = "A" * 9000 + "[stderr]\nboom\n[exit code: 7]" + "Z" * 4500
+    streams = _make_tool_then_text_response("EchoLong", {"message": long_message}, "tu_long", "done")
+
+    with patch.object(engine._client, "stream_messages", side_effect=streams) as stream:
+        events = list(engine.submit("use long tool"))
+
+    tool_result = [e for e in events if e[0] == "tool_result"][0][3]
+    assert len(tool_result.content) < len(long_message)
+    assert "tool result truncated" in tool_result.content
+    assert "[stderr]\nboom\n[exit code: 7]" in tool_result.content
+
+    second_messages = stream.call_args_list[1].kwargs["messages"]
+    tool_result_message = second_messages[2]
+    assert tool_result_message["content"][0]["content"] == tool_result.content
+
+
+def test_engine_normalizes_empty_tool_result_to_no_output():
+    class EmptyTool(Tool):
+        name = "Empty"
+        description = "Returns empty output"
+        input_schema = {
+            "type": "object",
+            "properties": {},
+        }
+
+        def execute(self) -> ToolResult:
+            return ToolResult(content="   \n")
+
+    engine = _make_engine_with_tools(EmptyTool())
+    streams = _make_tool_then_text_response("Empty", {}, "tu_empty", "done")
+
+    with patch.object(engine._client, "stream_messages", side_effect=streams):
+        events = list(engine.submit("use empty"))
+
+    tool_result = [e for e in events if e[0] == "tool_result"][0][3]
+    assert tool_result.content == "(no output)"
